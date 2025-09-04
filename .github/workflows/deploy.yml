@@ -5,10 +5,16 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: tradepal-api
+
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
     
     steps:
     - name: Checkout code
@@ -32,14 +38,31 @@ jobs:
     - name: Build application
       run: npm run build
 
-    - name: Create deployment package
-      run: |
-        tar -czf deploy.tar.gz \
-          --exclude=node_modules \
-          --exclude=.git \
-          --exclude=coverage \
-          --exclude=.env \
-          .
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
 
     - name: Deploy to VM
       uses: appleboy/ssh-action@v1.0.0
@@ -49,37 +72,21 @@ jobs:
         key: ${{ secrets.VM_SSH_KEY }}
         port: 22
         script: |
+          # Login to GitHub Container Registry
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          
+          # Pull the new image
+          docker pull ghcr.io/${{ github.repository_owner }}/tradepal-api:latest
+          
           # Navigate to project directory
           cd ~/tradepal
-          
-          # Backup current version
-          if [ -d "backup" ]; then rm -rf backup; fi
-          if [ -d "current" ]; then mv current backup; fi
-          mkdir -p current
-          
-          # Download and extract new version
-          curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-               -L "${{ github.api_url }}/repos/${{ github.repository }}/tarball/${{ github.sha }}" \
-               -o latest.tar.gz
-          
-          tar -xzf latest.tar.gz -C current --strip-components=1
-          rm latest.tar.gz
-          
-          # Copy environment file
-          cp .env current/.env
-          
-          # Build new Docker image
-          cd current
-          docker build -t tradepal-api:latest .
           
           # Stop current containers
           docker-compose -f docker-compose.prod.yml down
           
-          # Start new containers
+          # Update image tag in compose file and start
+          export IMAGE_TAG=ghcr.io/${{ github.repository_owner }}/tradepal-api:latest
           docker-compose -f docker-compose.prod.yml up -d
-          
-          # Wait for health check
-          sleep 30
           
           # Wait for containers to be ready
           echo "Waiting for containers to start..."
@@ -98,10 +105,7 @@ jobs:
               docker-compose -f docker-compose.prod.yml logs api
             fi
           else
-            echo "Deployment failed, rolling back"
-            docker-compose -f docker-compose.prod.yml down
-            cd ../backup
-            docker build -t tradepal-api:latest .
-            docker-compose -f docker-compose.prod.yml up -d
+            echo "Deployment failed"
+            docker-compose -f docker-compose.prod.yml logs
             exit 1
           fi
