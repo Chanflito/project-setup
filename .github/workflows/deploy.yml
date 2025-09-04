@@ -45,24 +45,12 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-        tags: |
-          type=ref,event=branch
-          type=ref,event=pr
-          type=sha,prefix={{branch}}-
-          type=raw,value=latest,enable={{is_default_branch}}
-
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
         push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
+        tags: ghcr.io/chanflito/tradepal-api:latest
 
     - name: Deploy to VM
       uses: appleboy/ssh-action@v1.0.0
@@ -71,41 +59,52 @@ jobs:
         username: ${{ secrets.VM_USER }}
         key: ${{ secrets.VM_SSH_KEY }}
         port: 22
+        timeout: 60s
+        command_timeout: 10m
         script: |
+          set -e
+          
           # Login to GitHub Container Registry
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           
           # Pull the new image
-          docker pull ghcr.io/${{ github.repository_owner }}/tradepal-api:latest
+          docker pull ghcr.io/chanflito/tradepal-api:latest
           
           # Navigate to project directory
           cd ~/tradepal
           
           # Stop current containers
-          docker-compose -f docker-compose.prod.yml down
+          docker-compose -f docker-compose.prod.yml down || true
           
-          # Update image tag in compose file and start
-          export IMAGE_TAG=ghcr.io/${{ github.repository_owner }}/tradepal-api:latest
+          # Start containers (IMAGE_TAG ya está configurado como default en docker-compose)
           docker-compose -f docker-compose.prod.yml up -d
           
-          # Wait for containers to be ready
+          # Wait for containers to start
           echo "Waiting for containers to start..."
           sleep 30
           
-          # Check if deployment was successful
+          # Check deployment status
           if docker-compose -f docker-compose.prod.yml ps | grep -q "Up"; then
-            echo "Deployment successful"
+            echo "Containers are running"
+            
             # Test API endpoint
-            if curl -f http://localhost:8080 > /dev/null 2>&1; then
-              echo "API is responding correctly"
-              # Clean up old images
-              docker image prune -f
-            else
-              echo "API not responding, checking logs..."
-              docker-compose -f docker-compose.prod.yml logs api
-            fi
+            for i in {1..5}; do
+              if curl -f http://localhost:8080 > /dev/null 2>&1; then
+                echo "API is responding correctly"
+                break
+              else
+                echo "API not ready, attempt $i/5..."
+                sleep 10
+              fi
+            done
+            
+            # Clean up old images
+            docker image prune -f || true
+            echo "Deployment successful"
+            
           else
-            echo "Deployment failed"
-            docker-compose -f docker-compose.prod.yml logs
+            echo "Deployment failed - containers not running"
+            docker-compose -f docker-compose.prod.yml ps
+            docker-compose -f docker-compose.prod.yml logs --tail=50
             exit 1
           fi
